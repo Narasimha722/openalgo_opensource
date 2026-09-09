@@ -96,3 +96,5 @@ bot integration
                                                                                                                                                                 
   - Heikin Ashi OHLC CSV (/D:/Personal/openalgo/backtesting/stratagies_Backtest_output/ATHERENERG_20260909_1L/ATHERENERG_heikin_ashi_5m.csv)                    
   - Actual versus HA candles, side by side (/D:/Personal/openalgo/backtesting/stratagies_Backtest_output/ATHERENERG_20260909_1L/real_vs_heikin_ashi.csv)
+
+  › i want to make some changes and what to enchance the strategy.D:\Personal\openalgo\backtesting\stratagies\ATHERENERG_ha_bb_vwap_backtest.pyproject

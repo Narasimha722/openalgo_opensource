@@ -318,6 +318,14 @@ def download_data(
 
         logger.info(f"Downloading {symbol}:{exchange}:{interval} from {start_date} to {end_date}")
 
+        auth_token, broker = get_auth_token_broker(api_key)
+        if auth_token and broker == "fyers":
+            from services.historify_download_service import download_fyers
+
+            return download_fyers(
+                symbol, exchange, interval, start_date, end_date, auth_token, resume=False
+            )
+
         # Fetch data from broker via history_service
         success, response, status_code = get_history(
             symbol=symbol,
@@ -1481,6 +1489,13 @@ def _process_download_job(job_id: str, api_key: str):
                 config = {}
 
         incremental = config.get("incremental", False)
+        from database.auth_db import db_session as auth_session
+
+        try:
+            auth_token, broker = get_auth_token_broker(api_key)
+        finally:
+            auth_session.remove()
+        fast_fyers = bool(auth_token and broker == "fyers")
 
         # Get delay settings from environment (min and max seconds)
         delay_min = float(os.getenv("HISTORIFY_DELAY_MIN", "1"))
@@ -1529,6 +1544,46 @@ def _process_download_job(job_id: str, api_key: str):
             processed_count += 1
             # Emit progress via Socket.IO
             _emit_progress(job_id, processed_count, total_items, item["symbol"])
+
+            if fast_fyers:
+                from services.historify_download_service import DownloadInterrupted, download_fyers
+
+                def checkpoint():
+                    while True:
+                        with _job_state_lock:
+                            running = _running_jobs.get(job_id, False)
+                            event = _paused_jobs.get(job_id)
+                        if not running:
+                            raise DownloadInterrupted()
+                        if event is None or event.is_set():
+                            return
+                        event.wait(timeout=0.5)
+
+                try:
+                    success, response, _ = download_fyers(
+                        item["symbol"], item["exchange"], job["interval"],
+                        job["start_date"], job["end_date"], auth_token,
+                        checkpoint=checkpoint,
+                    )
+                except DownloadInterrupted:
+                    update_job_item_status(item["id"], "pending")
+                    update_job_status(job_id, "cancelled")
+                    _cleanup_job(job_id)
+                    return
+                records = response.get("records", 0)
+                update_job_item_status(
+                    item["id"], "success" if success else "error",
+                    records, None if success else response.get("message"),
+                )
+                completed += int(success)
+                failed += int(not success)
+                update_job_progress(job_id, completed, failed)
+                if response.get("stop_job"):
+                    update_job_status(job_id, "failed", response["message"])
+                    _cleanup_job(job_id)
+                    return
+                # Every actual Fyers request is paced; no random stock cooldown.
+                continue
 
             try:
                 # Determine date ranges - use incremental if enabled
@@ -2014,11 +2069,17 @@ def retry_failed_items(job_id: str, api_key: str) -> tuple[bool, dict[str, Any],
         if not job:
             return False, {"status": "error", "message": "Job not found"}, 404
 
-        if job["status"] == "running":
-            return False, {"status": "error", "message": "Job is already running"}, 400
+        if job["status"] in ("running", "paused"):
+            return False, {
+                "status": "error",
+                "message": "Job is already running or paused; resume or cancel it first",
+            }, 400
 
         # Get failed items
-        failed_items = get_job_items(job_id, status="error")
+        failed_items = [
+            item for item in get_job_items(job_id)
+            if item["status"] in ("error", "pending", "downloading")
+        ]
         if not failed_items:
             return True, {"status": "success", "message": "No failed items to retry"}, 200
 

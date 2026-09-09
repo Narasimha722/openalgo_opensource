@@ -18,9 +18,17 @@ routinely exceeding the real 10 req/sec cap and getting HTTP 429'd.
 
 import threading
 import time
+from collections import deque
 
 _lock = threading.Lock()
 _last_call_time = 0.0
+_minute_calls = deque()
+_history_calls = deque()
+_day_key = None
+_day_calls = 0
+MAX_PER_MINUTE = 190
+HISTORY_PER_MINUTE = 150
+HISTORY_DAILY_BUDGET = 90000
 
 # Documented cap is 10 req/sec; pace at ~8 req/sec (0.125s) to leave headroom
 # for clock jitter and for order/fund/margin calls sharing the same quota
@@ -31,22 +39,41 @@ MAX_RETRIES = 3
 BASE_BACKOFF = 1.0  # seconds; exponential fallback when no Retry-After header: 1, 2, 4
 
 
-def apply_rate_limit():
+def apply_rate_limit(history=False):
     """Block the calling thread until it is safe to make another Fyers API call.
 
-    Shared process-wide (module-level lock + timestamp) so every caller
-    across broker.fyers.api paces against the same clock, regardless of how
-    many separate BrokerData/order_api calls are in flight at once.
+    Recheck dispatch against a shared second/minute budget. History has a
+    smaller minute/day allowance to leave room for interactive account calls.
+    State is local to this process, so HTTP 429 handling is still required.
     """
-    global _last_call_time
-    with _lock:
-        now = time.time()
-        elapsed = now - _last_call_time
-        sleep_time = MIN_INTERVAL - elapsed if elapsed < MIN_INTERVAL else 0
-        _last_call_time = now + sleep_time
-
-    if sleep_time > 0:
-        time.sleep(sleep_time)
+    global _last_call_time, _day_key, _day_calls
+    while True:
+        with _lock:
+            now = time.monotonic()
+            # Fyers account day in IST. Counters cover this process lifetime;
+            # broker responses remain authoritative across restarts/other apps.
+            day = int((time.time() + 19800) // 86400)
+            if day != _day_key:
+                _day_key, _day_calls = day, 0
+            if history and _day_calls >= HISTORY_DAILY_BUDGET:
+                raise RuntimeError("Fyers history daily budget reached; retry on the next IST day")
+            for calls in (_minute_calls, _history_calls):
+                while calls and calls[0] <= now - 60:
+                    calls.popleft()
+            delay = max(0, _last_call_time + MIN_INTERVAL - now)
+            if len(_minute_calls) >= MAX_PER_MINUTE:
+                delay = max(delay, _minute_calls[0] + 60 - now)
+            if history and len(_history_calls) >= HISTORY_PER_MINUTE:
+                delay = max(delay, _history_calls[0] + 60 - now)
+            if delay <= 0:
+                _last_call_time = now
+                _minute_calls.append(now)
+                if history:
+                    _history_calls.append(now)
+                _day_calls += 1
+                return
+        # Recheck at dispatch, so delayed threads cannot wake in a burst.
+        time.sleep(min(delay, 1.0))
 
 
 def retry_delay_from_headers(headers, attempt):

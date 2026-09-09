@@ -2,18 +2,23 @@ import json
 import os
 import time
 import urllib.parse
-from datetime import datetime
 
 import httpx
 import pandas as pd
 
 from broker.fyers.api.rate_limiter import MAX_RETRIES, apply_rate_limit, retry_delay_from_headers
-from database.token_db import get_br_symbol, get_oa_symbol
+from database.token_db import get_br_symbol
 from utils.constants import FNO_EXCHANGES
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+class FyersHistoryError(RuntimeError):
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
 
 
 def get_api_response(endpoint, auth, method="GET", payload="", _retry_count=0):
@@ -45,13 +50,16 @@ def get_api_response(endpoint, auth, method="GET", payload="", _retry_count=0):
         url = f"https://api-t1.fyers.in{endpoint}"
         headers = {"Authorization": f"{api_key}:{AUTH_TOKEN}", "Content-Type": "application/json"}
 
-        apply_rate_limit()
+        if endpoint.startswith("/data/history?"):
+            apply_rate_limit(history=True)
+        else:
+            apply_rate_limit()
 
         logger.debug(f"Making {method} request to Fyers API: {url}")
 
         # Make the request
         if method == "GET":
-            response = client.get(url, headers=headers)
+            response = client.get(url, headers=headers, timeout=30.0)
         elif method == "POST":
             response = client.post(
                 url,
@@ -66,15 +74,12 @@ def get_api_response(endpoint, auth, method="GET", payload="", _retry_count=0):
                 json=payload if isinstance(payload, dict) else json.loads(payload),
             )
 
-        # Add status attribute for compatibility
-        response.status = response.status_code
-
         # Raise HTTPError for bad responses (4xx, 5xx)
         response.raise_for_status()
 
         # Parse and return the JSON response
         response_data = response.json()
-        logger.debug(f"API response: {json.dumps(response_data, indent=2)}")
+        logger.debug("API response: %s", response_data)
         return response_data
 
     except httpx.HTTPStatusError as e:
@@ -87,10 +92,19 @@ def get_api_response(endpoint, auth, method="GET", payload="", _retry_count=0):
             time.sleep(delay)
             return get_api_response(endpoint, auth, method, payload, _retry_count + 1)
         logger.error(f"HTTP error during API request: {str(e)}")
-        return {"s": "error", "message": f"HTTP error: {str(e)}"}
+        return {
+            "s": "error",
+            "code": e.response.status_code,
+            "retryable": e.response.status_code >= 500,
+            "message": f"HTTP {e.response.status_code}: {e.response.reason_phrase}",
+        }
     except httpx.HTTPError as e:
         logger.error(f"HTTP error during API request: {str(e)}")
-        return {"s": "error", "message": f"HTTP error: {str(e)}"}
+        return {
+            "s": "error",
+            "retryable": True,
+            "message": f"{type(e).__name__}: {str(e) or 'Transport failure'}",
+        }
     except json.JSONDecodeError as e:
         logger.error(f"JSON decode error: {str(e)}")
         return {"s": "error", "message": f"Invalid JSON response: {str(e)}"}
@@ -178,7 +192,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception(f"Error fetching quotes for {exchange}:{symbol}")
-            raise Exception(f"Error fetching quotes: {e}")
+            raise Exception(f"Error fetching quotes: {e}") from e
 
     def get_multiquotes(self, symbols: list) -> list:
         """
@@ -238,7 +252,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
 
     def _fetch_oi_for_symbol(self, br_symbol: str) -> int:
         """
@@ -257,9 +271,7 @@ class BrokerData:
         response = get_api_response(f"/data/depth?symbol={encoded}&ohlcv_flag=1", self.auth_token)
 
         if response.get("s") != "ok":
-            logger.debug(
-                f"Depth fetch for OI failed for {br_symbol}: {response.get('message')}"
-            )
+            logger.debug(f"Depth fetch for OI failed for {br_symbol}: {response.get('message')}")
             return 0
 
         depth_data = response.get("d", {}).get(br_symbol, {})
@@ -392,6 +404,8 @@ class BrokerData:
             # Convert symbol to broker format
             br_symbol = get_br_symbol(symbol, exchange)
             logger.debug(f"Using broker symbol: {br_symbol}")
+            if not br_symbol:
+                raise ValueError(f"Unknown broker symbol: {exchange}:{symbol}")
 
             # Check for unsupported timeframes first
             if interval in ["W", "M"]:
@@ -450,138 +464,32 @@ class BrokerData:
 
             # Determine chunk size based on resolution
             if resolution == "1D":
-                chunk_days = 300  # For daily data
+                chunk_days = 366  # Fyers daily request limit
             elif resolution.endswith("S"):
                 chunk_days = 25  # For seconds data - max 30 trading days, use 25 to be safe
             else:
-                chunk_days = 60  # For minute/hour data
+                chunk_days = 100  # Fyers minute/hour request limit
 
-            # Process data in chunks
             current_start = start_dt
-            retry_count = 0
-            max_retries = 3
 
+            # Empty periods are normal before listing; only transient failures retry.
             while current_start <= end_dt:
-                try:
-                    # Calculate chunk end date
-                    current_end = min(current_start + pd.Timedelta(days=chunk_days - 1), end_dt)
-
-                    # Format dates for API call
-                    chunk_start = current_start.strftime("%Y-%m-%d")
-                    chunk_end = current_end.strftime("%Y-%m-%d")
-
-                    logger.debug(
-                        f"Fetching {resolution} data for {exchange}:{br_symbol} from {chunk_start} to {chunk_end}"
-                    )
-
-                    # URL encode the symbol to handle special characters
-                    encoded_symbol = urllib.parse.quote(br_symbol)
-
-                    # Determine if OI flag should be enabled based on exchange
-                    # OI is only available for derivatives (NFO, BFO, MCX, CDS)
-                    derivative_exchanges = ["NFO", "BFO", "MCX", "CDS"]
-                    enable_oi = exchange in derivative_exchanges
-
-                    # Construct endpoint with query parameters
-                    endpoint = (
-                        f"/data/history?"
-                        f"symbol={encoded_symbol}&"
-                        f"resolution={resolution}&"
-                        f"date_format=1&"  # Keep epoch format
-                        f"range_from={chunk_start}&"
-                        f"range_to={chunk_end}&"
-                        f"cont_flag=1"
-                    )  # For continuous data
-
-                    # Add OI flag only for derivatives
-                    if enable_oi:
-                        endpoint += "&oi_flag=1"
-
-                    logger.debug(f"Making request to endpoint: {endpoint}")
-                    response = get_api_response(endpoint, self.auth_token)
-
-                    if response.get("s") != "ok":
-                        error_msg = response.get("message", "Unknown error")
-                        logger.error(f"Error for chunk {chunk_start} to {chunk_end}: {error_msg}")
-
-                        if retry_count < max_retries:
-                            retry_count += 1
-                            logger.debug(f"Retrying... Attempt {retry_count} of {max_retries}")
-                            time.sleep(2 * retry_count)  # Exponential backoff
-                            continue
-
-                        # If max retries reached, move to next chunk
-                        retry_count = 0
-                        current_start = current_end + pd.Timedelta(days=1)
-                        time.sleep(1)
-                        continue
-
-                    # Reset retry count on success
-                    retry_count = 0
-
-                    # Get candles from response
-                    candles = response.get("candles", [])
-                    if candles:
-                        # Handle dynamic column count based on whether OI is enabled
-                        if enable_oi and len(candles[0]) == 7:
-                            # Derivatives with OI: [timestamp, open, high, low, close, volume, oi]
-                            df = pd.DataFrame(
-                                candles,
-                                columns=[
-                                    "timestamp",
-                                    "open",
-                                    "high",
-                                    "low",
-                                    "close",
-                                    "volume",
-                                    "oi",
-                                ],
-                            )
-                        else:
-                            # Equity without OI: [timestamp, open, high, low, close, volume]
-                            df = pd.DataFrame(
-                                candles,
-                                columns=["timestamp", "open", "high", "low", "close", "volume"],
-                            )
-                            # Add zero OI column for consistency
-                            df["oi"] = 0
-
-                        dfs.append(df)
-                        logger.debug(
-                            f"Got {len(candles)} candles for period {chunk_start} to {chunk_end}"
-                        )
-                    else:
-                        logger.debug(f"No data available for period {chunk_start} to {chunk_end}")
-
-                    # No inter-chunk sleep here: get_api_response already paces
-                    # every Fyers call through the process-wide apply_rate_limit
-                    # (125ms spacing) and honours Retry-After on 429s. The old
-                    # unconditional 0.5s sleep ran even after the LAST chunk,
-                    # putting a half-second floor under every history request --
-                    # a single-chunk intraday fetch spent 500ms sleeping on
-                    # 184ms of actual HTTP.
-
-                    # Move to next chunk
-                    current_start = current_end + pd.Timedelta(days=1)
-
-                except Exception as e:
-                    logger.error(f"Error fetching chunk {chunk_start} to {chunk_end}: {e}")
-                    if retry_count < max_retries:
-                        retry_count += 1
-                        logger.debug(f"Retrying... Attempt {retry_count} of {max_retries}")
-                        time.sleep(2 * retry_count)
-                        continue
-
-                    # If max retries reached, move to next chunk
-                    retry_count = 0
-                    current_start = current_end + pd.Timedelta(days=1)
-                    time.sleep(1)
-                    continue
+                current_end = min(current_start + pd.Timedelta(days=chunk_days - 1), end_dt)
+                chunk_start = current_start.strftime("%Y-%m-%d")
+                chunk_end = current_end.strftime("%Y-%m-%d")
+                df = self._fetch_history_chunk(
+                    br_symbol, exchange, resolution, chunk_start, chunk_end
+                )
+                if not df.empty:
+                    dfs.append(df)
+                current_start = current_end + pd.Timedelta(days=1)
 
             # If no data was found, return empty DataFrame
             if not dfs:
                 logger.warning("No data was collected for the entire period")
-                return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+                return pd.DataFrame(
+                    columns=["timestamp", "open", "high", "low", "close", "volume", "oi"]
+                )
 
             # Combine all chunks
             final_df = pd.concat(dfs, ignore_index=True)
@@ -597,11 +505,53 @@ class BrokerData:
         except Exception as e:
             error_msg = f"Error fetching historical data for {exchange}:{symbol}"
             logger.exception(error_msg)
-            raise Exception(f"{error_msg}: {e}")
+            if isinstance(e, FyersHistoryError):
+                raise
+            raise Exception(f"{error_msg}: {e}") from e
 
-    def get_option_chain(
-        self, symbol: str, strikecount: int, timestamp: str | None = None
-    ) -> dict:
+    def _fetch_history_chunk(self, br_symbol, exchange, resolution, start_date, end_date):
+        """Fetch one bounded window. Never hide failed windows as empty data."""
+        columns = ["timestamp", "open", "high", "low", "close", "volume", "oi"]
+        endpoint = (
+            f"/data/history?symbol={urllib.parse.quote(br_symbol)}"
+            f"&resolution={resolution}&date_format=1&range_from={start_date}"
+            f"&range_to={end_date}&cont_flag=1"
+        )
+        if exchange in FNO_EXCHANGES:
+            endpoint += "&oi_flag=1"
+        for attempt in range(MAX_RETRIES + 1):
+            response = get_api_response(endpoint, self.auth_token)
+            status = response.get("s")
+            candles = response.get("candles")
+            if status == "no_data" and not candles:
+                logger.info(f"No history for {br_symbol} from {start_date} to {end_date}")
+                return pd.DataFrame(columns=columns)
+            if status == "ok" and isinstance(candles, list):
+                if not candles:
+                    return pd.DataFrame(columns=columns)
+                width = len(candles[0])
+                if width not in (6, 7):
+                    raise ValueError(f"Invalid candle width {width} for {br_symbol}")
+                frame = pd.DataFrame(candles, columns=columns[:width])
+                if width == 6:
+                    frame["oi"] = 0
+                return frame.sort_values("timestamp").drop_duplicates("timestamp")
+            code = response.get("code")
+            message = response.get("message") or "No error message supplied"
+            error = (
+                f"Fyers history {br_symbol} {start_date} to {end_date}: "
+                f"status={status!r}, code={code!r}, message={message}"
+            )
+            # HTTP 429 is already retried by get_api_response. Do not multiply
+            # those retries here. Unknown/invalid-symbol/auth errors fail fast.
+            retryable = response.get("retryable", str(code) in ("500", "502", "503", "504"))
+            if not retryable or attempt == MAX_RETRIES:
+                raise FyersHistoryError(error, code)
+            delay = 2**attempt
+            logger.warning(f"{error}; retry {attempt + 1}/{MAX_RETRIES} in {delay}s")
+            time.sleep(delay)
+
+    def get_option_chain(self, symbol: str, strikecount: int, timestamp: str | None = None) -> dict:
         """
         Fetch strikes around ATM for `symbol` in a single call via Fyers'
         native /data/options-chain-v3 endpoint (see
@@ -734,4 +684,4 @@ class BrokerData:
 
         except Exception as e:
             logger.exception(f"Error fetching market depth for {exchange}:{symbol}")
-            raise Exception(f"Error fetching market depth: {e}")
+            raise Exception(f"Error fetching market depth: {e}") from e

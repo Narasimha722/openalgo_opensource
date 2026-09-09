@@ -7,7 +7,7 @@ Optimized for backtesting and analytical queries.
 """
 
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,6 +25,9 @@ load_dotenv()
 
 # Database path - in /db folder like other OpenAlgo databases
 HISTORIFY_DB_PATH = os.getenv("HISTORIFY_DATABASE_PATH", "db/historify.duckdb")
+# Historify shares the application host with request handling and live feeds.
+# DuckDB otherwise uses every logical CPU for each background query.
+HISTORIFY_DB_THREADS = max(1, int(os.getenv("HISTORIFY_DB_THREADS", "2")))
 
 
 def get_db_path() -> str:
@@ -72,7 +75,7 @@ def get_connection(max_retries: int = 3, retry_delay: float = 0.5):
         try:
             import duckdb
 
-            conn = duckdb.connect(db_path)
+            conn = duckdb.connect(db_path, config={"threads": HISTORIFY_DB_THREADS})
             break
         except Exception as e:
             last_error = e
@@ -99,6 +102,9 @@ def init_database():
     ensure_db_directory()
 
     with get_connection() as conn:
+        from database.historify_coverage import ensure_coverage_table
+
+        ensure_coverage_table(conn)
         # Main OHLCV data table - unified table approach
         conn.execute("""
             CREATE TABLE IF NOT EXISTS market_data (
@@ -501,7 +507,9 @@ def clear_watchlist() -> tuple[bool, str]:
 # =============================================================================
 
 
-def upsert_market_data(df: pd.DataFrame, symbol: str, exchange: str, interval: str) -> int:
+def upsert_market_data(
+    df: pd.DataFrame, symbol: str, exchange: str, interval: str, *, connection=None
+) -> int:
     """
     Insert or update OHLCV data from a pandas DataFrame.
 
@@ -531,6 +539,7 @@ def upsert_market_data(df: pd.DataFrame, symbol: str, exchange: str, interval: s
         # Ensure timestamp is integer (epoch seconds)
         if df["timestamp"].dtype != "int64":
             df["timestamp"] = pd.to_datetime(df["timestamp"]).astype("int64") // 10**9
+        df = df.drop_duplicates(subset=["timestamp"], keep="last")
 
         # Select only required columns in correct order
         df = df[
@@ -548,7 +557,35 @@ def upsert_market_data(df: pd.DataFrame, symbol: str, exchange: str, interval: s
             ]
         ]
 
-        with get_connection() as conn:
+        with (nullcontext(connection) if connection is not None else get_connection()) as conn:
+            key = [symbol.upper(), exchange.upper(), interval]
+            existing = conn.execute(
+                """
+                SELECT id, first_timestamp, last_timestamp FROM data_catalog
+                WHERE symbol = ? AND exchange = ? AND interval = ?
+                """,
+                key,
+            ).fetchone()
+            new_records = None
+            first_incoming = int(df["timestamp"].min())
+            last_incoming = int(df["timestamp"].max())
+            # The download writer supplies an open transaction, so this overlap
+            # count and the upsert see one consistent snapshot. Standalone
+            # imports retain a full recount to repair any stale catalog state.
+            if connection is not None and existing:
+                overlaps = 0
+                if (existing[1] is None or existing[2] is None or
+                        (first_incoming <= existing[2] and last_incoming >= existing[1])):
+                    overlaps = conn.execute(
+                        """
+                        SELECT COUNT(*) FROM market_data AS stored
+                        SEMI JOIN df AS incoming ON stored.timestamp = incoming.timestamp
+                        WHERE stored.symbol = ? AND stored.exchange = ? AND stored.interval = ?
+                          AND stored.timestamp BETWEEN ? AND ?
+                        """,
+                        key + [first_incoming, last_incoming],
+                    ).fetchone()[0]
+                new_records = len(df) - overlaps
             # Use INSERT with ON CONFLICT for upsert (DuckDB requires explicit conflict target)
             conn.execute("""
                 INSERT INTO market_data
@@ -564,36 +601,38 @@ def upsert_market_data(df: pd.DataFrame, symbol: str, exchange: str, interval: s
                     oi = EXCLUDED.oi
             """)
 
-            # Update catalog - check if exists first due to multiple constraints
-            existing = conn.execute(
-                """
-                SELECT id FROM data_catalog
-                WHERE symbol = ? AND exchange = ? AND interval = ?
-            """,
-                [symbol.upper(), exchange.upper(), interval],
-            ).fetchone()
-
-            if existing:
+            if existing and new_records is not None:
+                # Work proportional to this chunk, not all history for the stock.
+                conn.execute(
+                    """
+                    UPDATE data_catalog SET
+                        first_timestamp = LEAST(first_timestamp, ?),
+                        last_timestamp = GREATEST(last_timestamp, ?),
+                        record_count = record_count + ?,
+                        last_download_at = current_timestamp
+                    WHERE symbol = ? AND exchange = ? AND interval = ?
+                    """,
+                    [first_incoming, last_incoming, new_records] + key,
+                )
+            elif existing:
                 # Update existing record
                 conn.execute(
                     """
                     UPDATE data_catalog SET
-                        first_timestamp = (SELECT MIN(timestamp) FROM market_data
-                                          WHERE symbol = ? AND exchange = ? AND interval = ?),
-                        last_timestamp = (SELECT MAX(timestamp) FROM market_data
-                                         WHERE symbol = ? AND exchange = ? AND interval = ?),
-                        record_count = (SELECT COUNT(*) FROM market_data
-                                       WHERE symbol = ? AND exchange = ? AND interval = ?),
+                        first_timestamp = stats.first_ts,
+                        last_timestamp = stats.last_ts,
+                        record_count = stats.records,
                         last_download_at = current_timestamp
-                    WHERE symbol = ? AND exchange = ? AND interval = ?
+                    FROM (
+                        SELECT MIN(timestamp) AS first_ts, MAX(timestamp) AS last_ts,
+                               COUNT(*) AS records
+                        FROM market_data
+                        WHERE symbol = ? AND exchange = ? AND interval = ?
+                    ) AS stats
+                    WHERE data_catalog.symbol = ? AND data_catalog.exchange = ?
+                      AND data_catalog.interval = ?
                 """,
                     [
-                        symbol.upper(),
-                        exchange.upper(),
-                        interval,
-                        symbol.upper(),
-                        exchange.upper(),
-                        interval,
                         symbol.upper(),
                         exchange.upper(),
                         interval,
@@ -1230,6 +1269,9 @@ def delete_market_data(symbol: str, exchange: str, interval: str | None = None) 
     """
     try:
         with get_connection() as conn:
+            from database.historify_coverage import clear_coverage
+
+            clear_coverage(conn, symbol, exchange, interval)
             if interval:
                 conn.execute(
                     """
@@ -1303,6 +1345,9 @@ def bulk_delete_market_data(
 
                 try:
                     # Delete from market_data
+                    from database.historify_coverage import clear_coverage
+
+                    clear_coverage(conn, symbol, exchange)
                     result = conn.execute(
                         """
                         DELETE FROM market_data
@@ -1469,9 +1514,11 @@ def get_database_stats() -> dict[str, Any]:
         db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
 
         with get_connection() as conn:
-            total_records = conn.execute("SELECT COUNT(*) FROM market_data").fetchone()[0]
+            total_records = conn.execute(
+                "SELECT COALESCE(SUM(record_count), 0) FROM data_catalog"
+            ).fetchone()[0]
             total_symbols = conn.execute(
-                "SELECT COUNT(DISTINCT symbol || exchange) FROM market_data"
+                "SELECT COUNT(*) FROM (SELECT DISTINCT symbol, exchange FROM data_catalog)"
             ).fetchone()[0]
             watchlist_count = conn.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0]
 

@@ -1205,7 +1205,7 @@ export default function Historify() {
       })
       const data = await response.json()
       if (data.status === 'success') {
-        showToast.success(`Retrying ${data.retry_count} failed items`, 'historify')
+        showToast.success(`Resuming ${data.retry_count} unfinished items`, 'historify')
         loadJobs()
       } else {
         showToast.error(data.message || 'Failed to retry job', 'historify')
@@ -2496,18 +2496,18 @@ export default function Historify() {
                                         </Button>
                                       </>
                                     )}
-                                    {(job.status === 'completed_with_errors' ||
-                                      job.status === 'failed') &&
-                                      job.failed_symbols > 0 && (
-                                        <Button
-                                          variant="outline"
-                                          size="sm"
-                                          onClick={() => retryJob(job.id)}
-                                        >
-                                          <RefreshCw className="h-4 w-4 mr-1" />
-                                          Retry
-                                        </Button>
-                                      )}
+                                    {(job.status === 'failed' ||
+                                      (job.status === 'completed_with_errors' &&
+                                        job.failed_symbols > 0)) && (
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={() => retryJob(job.id)}
+                                      >
+                                        <RefreshCw className="h-4 w-4 mr-1" />
+                                        Retry
+                                      </Button>
+                                    )}
                                     {job.status !== 'running' && job.status !== 'paused' && (
                                       <Button
                                         variant="ghost"

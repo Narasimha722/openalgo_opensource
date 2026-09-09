@@ -73,6 +73,7 @@ MIGRATIONS = [
     # Feature migrations
     ("migrate_historify.py", "Historify DuckDB Setup"),
     ("migrate_historify_scheduler.py", "Historify Scheduler Tables"),
+    ("migrate_historify_coverage.py", "Historify Download Coverage"),
     ("migrate_flow.py", "Flow Workflow Automation"),
     ("migrate_health_process_details.py", "Health Metrics Process Details"),
     ("migrate_master_contract_stats.py", "Master Contract Smart Download"),
