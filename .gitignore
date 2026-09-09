@@ -104,6 +104,9 @@ yarn-error.log*
 # Windows NUL file
 nul
 
+# Personal backtesting workspace (kept out of the repo unless force-added)
+backtesting/
+
 # Personal workspace: your own indicators, research, backtests and notes.
 # Only the readme is tracked -- everything else is yours and stays local.
 # NOTE: gitignore is not a secrecy boundary. `git add -f` bypasses it, and

@@ -2322,6 +2322,8 @@ def export_to_parquet(
     """
     import tempfile
 
+    from utils.historical_data_export import prepare_export_frame, write_export_parquet
+
     try:
         # Validate output path - must be within temp directory
         temp_dir = tempfile.gettempdir()
@@ -2333,7 +2335,7 @@ def export_to_parquet(
         ist_offset = 19800
 
         skipped_intervals: list[str] = []
-        frames: list[pd.DataFrame] = []
+        frames = []
 
         with get_connection() as conn:
             # Resolve symbol list — explicit, or every symbol in the catalog
@@ -2476,19 +2478,9 @@ def export_to_parquet(
                 if df is None or df.empty:
                     continue
 
-                # Decorate with symbol metadata + datetime so the parquet schema matches
-                # the original export contract (symbol, exchange, interval, timestamp,
-                # OHLCV+oi, datetime) regardless of which branch produced the rows.
-                df = df.assign(symbol=sym, exchange=exch, interval=target_interval)
-                df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
-                df = df[
-                    [
-                        "symbol", "exchange", "interval", "timestamp",
-                        "open", "high", "low", "close", "volume", "oi",
-                        "datetime",
-                    ]
-                ]
-                frames.append(df)
+                # Convert each result before adding repeated metadata, avoiding a
+                # second combined pandas table for large multi-symbol exports.
+                frames.append(prepare_export_frame(df, sym, exch, target_interval))
 
         if not frames:
             if skipped_intervals:
@@ -2499,14 +2491,7 @@ def export_to_parquet(
                 )
             return False, "No data matching the criteria", 0
 
-        combined = pd.concat(frames, ignore_index=True)
-        combined = combined.sort_values(["symbol", "exchange", "interval", "timestamp"])
-
-        # pyarrow's "none" isn't a valid codec — translate the API value
-        pq_compression = None if compression == "none" else compression
-        combined.to_parquet(abs_output, compression=pq_compression, index=False)
-
-        record_count = len(combined)
+        record_count = write_export_parquet(frames, abs_output, compression)
         file_size = os.path.getsize(abs_output) / (1024 * 1024)  # MB
         message = f"Exported {record_count} records ({file_size:.2f} MB)"
         if skipped_intervals:

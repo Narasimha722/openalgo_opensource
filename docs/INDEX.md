@@ -23,6 +23,8 @@ need → drill into the specific file. Don't load everything at once.
 | Strategy module & risk engine (multi-leg options, signal mode, RMS) | [prompt/strategy_rms_documentation.md](prompt/strategy_rms_documentation.md) · [api/strategy-services/](api/strategy-services/) · [prd/strategy-module-rms.md](prd/strategy-module-rms.md) · [bdd/strategy_module_rms.feature](bdd/strategy_module_rms.feature) |
 | Technical indicators (`ta` library) | [<prompt/indicators/openalgo indicators - introduction.md>](<prompt/indicators/openalgo indicators - introduction.md>) |
 | The charting terminal at `/trading`, its order dock and its shortcuts | [userguide/32-charting-terminal](userguide/32-charting-terminal/README.md) |
+| Position calculator, brokerage estimates and automatic exit watches | [Position calculator](userguide/32-charting-terminal/position-calculator.md) |
+| Planned Fyers historical backfill: 1,500 stocks, 5-minute candles, nine years | [Fyers download plan](plans/2026-09-08-fyers-historical-data-download-plan.md) |
 | Writing your own chart indicators for `/trading` | [custom-indicators.md](custom-indicators.md) |
 | Step-by-step user guide (setup → first order → integrations) | [userguide/README.md](userguide/README.md) |
 | MCP tool reference (Claude Desktop / Cursor / Windsurf) | [mcp-tool-reference.md](mcp-tool-reference.md) |
