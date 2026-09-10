@@ -72,6 +72,7 @@ from blueprints.historify import historify_bp  # Import the historify blueprint
 from blueprints.ivchart import ivchart_bp  # Import the IV chart blueprint
 from blueprints.ivsmile import ivsmile_bp  # Import the IV Smile blueprint
 from blueprints.latency import latency_bp  # Import the latency blueprint
+from blueprints.market_scanner import market_scanner_bp
 from blueprints.leverage import leverage_bp  # Import the leverage blueprint
 from blueprints.log import log_bp
 from blueprints.logging import logging_bp  # Import the logging blueprint
@@ -325,6 +326,7 @@ def create_app():
     app.register_blueprint(logging_bp)  # Register Logging blueprint
     app.register_blueprint(admin_bp)  # Register Admin blueprint
     app.register_blueprint(historify_bp)  # Register Historify blueprint
+    app.register_blueprint(market_scanner_bp)
     app.register_blueprint(ivchart_bp)  # Register IV chart blueprint
     app.register_blueprint(scalping_bp)  # Register Scalping terminal blueprint
     app.register_blueprint(watchlist_bp)  # Register charting watchlist blueprint

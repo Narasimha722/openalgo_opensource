@@ -36,6 +36,7 @@ try autoreaserch for strategy parameters.
 build volume filter then backtest the strategy.
 canles data is in correct.
 candle iteeration
+scanner should work with all brokers.
 
 
 i want to update my strategy D:\Personal\openalgo\backtesting\stratagies\ATHERENERG_ha_bb_vwap_backtest.py same stratagy for all stocks.
